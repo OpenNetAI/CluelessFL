@@ -1,4 +1,4 @@
-# **CluelessFL: A Server-Clueless Federated Learning Platform with Distillation Solution**
+# **CluelessFL: A Server-Clueless Federated Learning Platform with Knowledge Distillation**
 
 Prototype of our server-clueless FL platform, CluelessFL. The paper is under review at SIGMOD2023.
 
