@@ -1,15 +1,27 @@
+class PublicKey:
+    def __init__(self, A, P, n, s):
+        self.A = A
+        self.P = P
+        self.n = n
+        self.s = s
+
+    def __repr__(self):
+        return 'PublicKey({}, {}, {}, {})'.format(self.A, self.P, self.n, self.s)
+
 import torch
 import os, sys
 sys.path.append(os.path.abspath(os.path.dirname(__file__) + '/' + '..' + '/' + '..'))
+import random
 import copy
 import collections
 import torch.optim as optim
 import torch.nn as nn
+sys.path.append("./HEUtils")
 import numpy as np
+import math
 from data.generate_niid_dirichlet import Generate_niid_dirichelet
 
-
-def generate_niid_dirichelet_Clients(args, model):
+def generate_niid_dirichelet_Clients(args, model, pk, sk):
     trainsetdata_dict, testsetdata_dict, testset, labels= Generate_niid_dirichelet(args)
     print("Complete to generate dataset.")
     print("Generating Clients......")
@@ -22,7 +34,7 @@ def generate_niid_dirichelet_Clients(args, model):
     
     clients = []
     for i, user in enumerate(users):
-        client = ClientFedScaf(args, model, i)
+        client = ClientFedScaf(args, model, i, pk, sk)
         
         data = user_data[user]
         datax = data['x']
@@ -31,7 +43,10 @@ def generate_niid_dirichelet_Clients(args, model):
         client_data=[]
 
         for j in range(datax.shape[0]):
-            client_data.append((torch.tensor(datax[j]),datay[j]))
+            if args.dataset == "imdb":
+                client_data.append((torch.LongTensor(datax[j]),datay[j]))
+            else:
+                client_data.append((torch.tensor(datax[j]),datay[j]))
         
         shuffled_array = np.array(client_data)
         np.random.shuffle(shuffled_array)
@@ -41,10 +56,39 @@ def generate_niid_dirichelet_Clients(args, model):
     return testset, clients
 
 
+def generate_clients(args, model, pk, sk):
+    data_generator = load_data.DataGenerator()
+    # Generate local data by label
+    _,testset = data_generator.generate(args)       # generate grouped dataset
+    unique_labels = data_generator.labels
+    loader = load_data.BiasLoader(data_generator)
+
+    # config local data
+    if isinstance(args.p_size, list):
+        start, stop = args.p_size[0], args.p_size[-1]
+        partition_size = [random.randint(start, stop) for _ in range(args.num_clients)]
+    else:
+        partition_size = [args.p_size for _ in range(args.num_clients)]
+    # pref = [random.choice(unique_labels) for _ in range(args.num_clients)]
+    pref = unique_labels * (int(args.num_clients/len(unique_labels)))
+    random.shuffle(pref)
+    bias = args.bias
+    
+    # generate clients
+    clients = []
+    for i in range(args.num_clients):
+        client = ClientFedScaf(args, model, i, pk, sk)
+        client.set_bias(bias, pref[i], partition_size[i])
+        client_data = loader.get_partition(client)
+        client.set_data(client_data, args.batch_size, loader.labels)
+        clients.append(client)
+    return testset, clients
+
 class ClientFedScaf(object):
-    def __init__(self, args, model, i):
+    def __init__(self, args, model, i, pk, sk):
         self.client_id = i
         self.model = copy.deepcopy(model)
+        self.upload = {}
         self.optimizer = FedScafOptimizer(self.model.parameters(), lr=args.learning_rate, weight_decay=1e-4,momentum=0.9)
         self.criterion = nn.CrossEntropyLoss()
         model_parameters = self.model.state_dict()  # 提取网络参数
@@ -54,7 +98,12 @@ class ClientFedScaf(object):
         self.controls = [torch.zeros_like(p.data) for p in self.model.parameters() if p.requires_grad]
         self.server_controls = [torch.zeros_like(p.data) for p in self.model.parameters() if p.requires_grad]
         self.delta_model = [torch.zeros_like(p.data) for p in self.model.parameters() if p.requires_grad]
-        self.alpha=0.1
+
+        # HE settings
+        self.prec = 32
+        self.bound = 2 ** 3
+        self.pk = pk
+        self.sk = sk
 
     # Set non-IID data configurations
     def set_bias(self, bias, pref, partition_size):
@@ -104,9 +153,12 @@ class ClientFedScaf(object):
         return lr
     
     def train(self,args, glob_iter, server_broadcast_dict):
+        from HEUtils.cuda_test import KeyGen, Enc, Dec
+
         print('Training on client #{}'.format(self.client_id))
         if 'params_sum' in server_broadcast_dict.keys():
             self.update(server_broadcast_dict)
+        temp_model = copy.deepcopy(self.model)
         self.model.cuda()
         self.model.train()
         g_model = copy.deepcopy(self.model)
@@ -130,18 +182,87 @@ class ClientFedScaf(object):
         for i,p in enumerate(self.model.parameters()):
             temp[i] = p.data.clone()
         for i, p in enumerate(g_model.parameters()):
-            self.controls[i] = self.controls[i] - self.server_controls[i] +\
-                                            self.alpha*(p.data - temp[i]) / (cnt * args.learning_rate)
+            self.controls[i] = self.controls[i] - self.server_controls[i] + (p.data - temp[i]) / (cnt * args.learning_rate)
 
-        # get params
-        self.upload = {"params":self.model.state_dict(), 'c_controls':self.controls}
-        return self.upload
+        # upload dict with HE
+        params_modules = list(self.model.named_parameters())
+        params_list, controls_list = [], []
+        for i, params_module in enumerate(params_modules):
+            name, params = params_module
+            params_list.append(copy.deepcopy(params.data).view(-1))
+            controls_list.append(copy.deepcopy(self.controls[i]).view(-1))
 
-    def update(self, server_broadcast_dict):
-        if 'params_sum' in server_broadcast_dict.keys():
-            params_sum, avg_controls = server_broadcast_dict["params_sum"],server_broadcast_dict["avg_controls"]
-            self.model.load_state_dict(copy.deepcopy(params_sum))
-            self.server_controls = copy.deepcopy(avg_controls)
+        if args.chunk:
+            res = torch.cat(params_list, 0)
+            con_res = torch.cat(controls_list, 0)
+            chunks = math.ceil(len(res) / 65535)
+            chun = res.chunk(chunks,0)
+            con_chun = con_res.chunk(chunks,0)
+            chun_size_list = [i.numel() for i in chun]
+            client_encrypted_params_list, client_enc_controls_list = [], []
+            for i, chun_p in enumerate(chun):
+                p = ((chun_p + self.bound) * 2 ** self.prec).long().cuda()
+                q = ((con_chun[i] + self.bound) * 2 ** self.prec).long().cuda()
+                client_encrypted_params = Enc(self.pk, p)    # 加密梯度
+                client_encrypted_controls = Enc(self.pk, q) 
+                client_encrypted_params_list.append(copy.deepcopy(client_encrypted_params))
+                client_enc_controls_list.append(copy.deepcopy(client_encrypted_controls))
+            self.upload['c_encrypted_params'] = (client_encrypted_params_list,chun_size_list)
+            self.upload['c_encrypted_controls'] = client_enc_controls_list
+        else:
+            params = ((torch.cat(params_list, 0) + self.bound) * 2 ** self.prec).long().cuda()
+            controls = ((torch.cat(controls_list, 0) + self.bound) * 2 ** self.prec).long().cuda()
+            client_encrypted_params = Enc(self.pk, params)    # 加密梯度
+            client_encrypted_controls = Enc(self.pk, controls)
+            self.upload['c_encrypted_params'] = client_encrypted_params
+            self.upload['c_encrypted_controls'] = client_encrypted_controls
+
+        # self.upload['c_controls'] = self.controls
+        return self.upload, temp_model
+
+    def decode(self, args, encrypted_sum, encrypted_controls, selected_num):
+        from HEUtils.cuda_test import KeyGen, Enc, Dec
+        if args.chunk:
+            data_sum_list, control_sum_list = [], []
+            encrypted_sum_chunks, chun_size_list = encrypted_sum
+            encrypted_control_chunks = encrypted_controls
+            for i, encrypted_chunk in enumerate(encrypted_sum_chunks):
+                data_sum = Dec(self.sk, encrypted_chunk).float() / (2 ** self.prec) / selected_num - self.bound
+                data_sum_list.append(copy.deepcopy(data_sum[0:chun_size_list[i]]))
+                control_sum = Dec(self.sk, encrypted_control_chunks[i]).float() / (2 ** self.prec) / selected_num - self.bound
+                control_sum_list.append(copy.deepcopy(control_sum[0: chun_size_list[i]]))
+            decode_sum = torch.cat(data_sum_list, 0).cuda()
+            decode_controls = torch.cat(control_sum_list, 0).cuda()
+        else:
+            decode_sum = Dec(self.sk, encrypted_sum).float() / (2 ** self.prec) / selected_num - self.bound
+            decode_controls = Dec(self.sk, encrypted_controls).float() / (2 ** self.prec) / selected_num - self.bound
+
+        ind = 0
+        client_data_dict, client_control_list = dict(), []
+        for i, key in enumerate(self.model_parameters_dict):
+            params_size, params_shape = self.model_parameters_dict[key]
+            client_data_dict[key] = decode_sum[ind : ind + params_size].reshape(params_shape)
+            client_control_list[i] = decode_controls[ind : ind + params_size].reshape(params_shape)
+            ind += params_size
+
+        # 加载新的模型参数
+        params_modules_server = self.model.named_parameters()
+        for params_module in params_modules_server:
+            name, params = params_module
+            params.data = client_data_dict[name]  # 用字典中存储的子模型的梯度覆盖网络中的参数梯度
+        self.model.load_state_dict(copy.deepcopy(client_data_dict))
+        self.global_model_params = copy.deepcopy(self.model.state_dict())
+        self.controls = client_control_list
+        
+
+    def update(self, args, server_broadcast_dict):
+        # avg_controls = server_broadcast_dict["avg_controls"]
+        # self.server_controls = copy.deepcopy(avg_controls)
+
+        encrypted_sum = server_broadcast_dict['encrypted_sum']
+        encrypted_controls = server_broadcast_dict["encrypted_controls_sum"]
+        selected_num = server_broadcast_dict['selected_num']
+        self.decode(args, encrypted_sum, encrypted_controls, selected_num)
 
 
 class FedScafOptimizer(optim.Optimizer):
@@ -167,7 +288,9 @@ class FedScafOptimizer(optim.Optimizer):
                         buf = param_state['momentum_buffer']
                         buf.mul_(momentum).add_(1, d_p)
                     d_p = buf
-
+                # d_p = p.grad.data + c.data - ci.data
+                
+                # d_p = p.grad.data
                 p.data = p.data -group['lr'] * (d_p+ c.data - ci.data)
 
         return loss

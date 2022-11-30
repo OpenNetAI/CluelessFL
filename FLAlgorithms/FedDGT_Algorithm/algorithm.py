@@ -1,8 +1,10 @@
 from .server import ServerFedDGT
-from .clients import generate_clients, generate_niid_dirichelet_Clients
+from .clients import generate_niid_dirichelet_Clients
 from model_utils.create_model import create_model, create_mlp_model
 import torch
 import copy
+import sys
+sys.path.append("./HEUtils")
 import os
 from tensorboardX import SummaryWriter
 
@@ -10,11 +12,13 @@ from tensorboardX import SummaryWriter
 class FedDGT(object):
     def __init__(self, args, run_time):
         # # 密钥生成
-        # pk, sk = KeyGen()
+        from HEUtils.cuda_test import KeyGen
+        pk, sk = KeyGen()
         if args.dataset == 'emnist':
             model = create_model(args.model, num_classes=47)
-        elif args.dataset in ('covtype', 'rcv1'):
+        elif args.dataset in ('adult', 'covtype', 'rcv1'):
             input_size = {
+                'adult': 123,
                 'covtype': 54,
                 'rcv1': 47236
             }[args.dataset]
@@ -22,10 +26,7 @@ class FedDGT(object):
         else:
             model = create_model(args.model)
         self.Server = ServerFedDGT(args, model, run_time)
-        if args.dirichlet == 0:
-            self.testset, self.Clients = generate_clients(args, model)
-        else:
-            self.testset, self.Clients = generate_niid_dirichelet_Clients(args, model)
+        self.testset, self.Clients = generate_niid_dirichelet_Clients(args, model, pk, sk)
         self.writer = SummaryWriter(os.path.join(args.board_dir, args.algorithm))
         self.testmodel = copy.deepcopy(model)
         self.max_acc = 0
@@ -46,7 +47,7 @@ class FedDGT(object):
             c_upload_list = []
             for id, c in enumerate(selected_clients):
                 # clients firstly update, and then train locally
-                c_upload = c.train(args, epoch, self.Server.broadcast_dict)
+                c_upload, temp_model = c.train(args, epoch, self.Server.broadcast_dict)
                 # c_upload = c.train(args, epoch)
                 c_upload_list.append(c_upload)
             
@@ -54,7 +55,8 @@ class FedDGT(object):
             self.Server.aggregate(c_upload_list)
 
             # test global model accuracy of round epoch
-            self.test(args, epoch, testloader)
+            self.test(args, epoch, testloader, temp_model)
+            del temp_model
             
         print('Max accuracy:', self.max_acc)
 
@@ -62,24 +64,32 @@ class FedDGT(object):
         # prepare dataset
         if args.dataset=='mnist':
             testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2,batch_size=100,shuffle=False)
-        elif 'fashionmnist' in args.dataset:
+        elif args.dataset=='fashionmnist':
             testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2,batch_size=100,shuffle=False)
         elif args.dataset=='cifar10':
             testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2,batch_size=100,shuffle=False)
+        elif args.dataset=='imdb':
+            test_sample = torch.utils.data.SequentialSampler(dataset_test)
+            testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2,batch_size=64,sampler=test_sample)
+        elif args.dataset=='celeba':
+            testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2, batch_size=64)
         elif args.dataset=='emnist':
             testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2, batch_size=100, shuffle=False)
         elif args.dataset=='svhn':
             testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2, batch_size=100, shuffle=False)
-        elif args.dataset in ('covtype', 'rcv1'):
+        elif args.dataset in ('adult', 'covtype', 'rcv1'):
             testloader = torch.utils.data.DataLoader(dataset_test,num_workers=2, batch_size=64, shuffle=False)
         return testloader
 
-    def test(self, args, epoch, testloader):
+
+    def test(self, args, epoch, testloader, temp_model):
+        # self.testmodel.load_state_dict(self.selected_clients[0].global_model_params)
         # get test accuracy
-        if args.partial_sharing:
-            testmodel = copy.deepcopy(self.Clients[0].model)
-        else:
-            testmodel = copy.deepcopy(self.Server.model)
+        # if args.partial_sharing:
+        #     testmodel = copy.deepcopy(self.Clients[0].model)
+        # else:
+        #     testmodel = copy.deepcopy(self.Server.model)
+        testmodel = copy.deepcopy(temp_model)
         testmodel.eval()
         with torch.no_grad():
             correct = 0
